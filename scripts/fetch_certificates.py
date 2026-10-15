@@ -7,8 +7,6 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
-# API endpoints
-API_BASE = "https://sideloading.net/api/certificates"
 LIST_ENDPOINTS = {
     "all": "/list/all",
     "signed": "/list/signed", 
@@ -16,11 +14,22 @@ LIST_ENDPOINTS = {
     "missingP12": "/list/missingP12"
 }
 
-# State file to track certificates
-STATE_FILE = Path(__file__).parent.parent / "certificates_state.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_FILE = REPO_ROOT / "config.json"
+STATE_FILE = REPO_ROOT / "certificates_state.json"
 
-# Certificate storage directory
-CERT_DIR = Path(__file__).parent.parent / "certificates"
+CERT_DIR = REPO_ROOT / "certificates"
+
+def load_config() -> Dict:
+    """Load the repository configuration."""
+    with CONFIG_FILE.open(encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    if not isinstance(config, dict):
+        raise ValueError(f"{CONFIG_FILE} must contain a JSON object")
+    api_base = config.get("certificate_api_url")
+    if not isinstance(api_base, str) or not api_base.startswith(("http://", "https://")):
+        raise ValueError("'certificate_api_url' must be an HTTP(S) URL")
+    return config
 
 def load_state() -> Dict:
     """Load the current state of certificates."""
@@ -34,9 +43,9 @@ def save_state(state: Dict):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f, indent=2)
 
-def fetch_certificates(status: str = "all") -> List[Dict]:
+def fetch_certificates(api_base: str, status: str = "all") -> List[Dict]:
     """Fetch certificates from the API."""
-    endpoint = f"{API_BASE}{LIST_ENDPOINTS.get(status, LIST_ENDPOINTS['all'])}"
+    endpoint = f"{api_base}{LIST_ENDPOINTS.get(status, LIST_ENDPOINTS['all'])}"
     
     try:
         response = requests.get(endpoint, timeout=30)
@@ -46,12 +55,12 @@ def fetch_certificates(status: str = "all") -> List[Dict]:
         print(f"Failed to fetch certificates: {e}")
         return []
 
-def download_certificate_file(cert_id: int, file_type: str, output_path: Path, is_missing_p12: bool = False) -> bool:
+def download_certificate_file(api_base: str, cert_id: int, file_type: str, output_path: Path, is_missing_p12: bool = False) -> bool:
     """Download a certificate file from the API."""
     if is_missing_p12:
-        endpoint = f"{API_BASE}/download/missingP12/{cert_id}/{file_type}"
+        endpoint = f"{api_base}/download/missingP12/{cert_id}/{file_type}"
     else:
-        endpoint = f"{API_BASE}/download/{cert_id}/{file_type}"
+        endpoint = f"{api_base}/download/{cert_id}/{file_type}"
     
     try:
         response = requests.get(endpoint, timeout=30)
@@ -67,12 +76,12 @@ def download_certificate_file(cert_id: int, file_type: str, output_path: Path, i
         print(f"  Failed to download {file_type} for cert {cert_id}: {e}")
         return False
 
-def download_certificate_zip(cert_id: int, cert_name: str, output_dir: Path, is_missing_p12: bool = False) -> bool:
+def download_certificate_zip(api_base: str, cert_id: int, cert_name: str, output_dir: Path, is_missing_p12: bool = False) -> bool:
     """Download and extract certificate zip file."""
     if is_missing_p12:
-        endpoint = f"{API_BASE}/download/missingP12/{cert_id}/cert.zip"
+        endpoint = f"{api_base}/download/missingP12/{cert_id}/cert.zip"
     else:
-        endpoint = f"{API_BASE}/download/{cert_id}/cert.zip"
+        endpoint = f"{api_base}/download/{cert_id}/cert.zip"
     
     zip_path = output_dir / f"{cert_name}.zip"
     
@@ -134,6 +143,9 @@ def get_certificate_files(cert_dir: Path) -> Dict[str, Optional[Path]]:
 
 def main():
     """Main function to fetch and download certificates."""
+    config = load_config()
+    api_base = config["certificate_api_url"].rstrip("/")
+
     # Create certificates directory
     CERT_DIR.mkdir(parents=True, exist_ok=True)
     
@@ -144,7 +156,7 @@ def main():
     print("=" * 50)
     
     # Fetch all certificates
-    all_certs = fetch_certificates("all")
+    all_certs = fetch_certificates(api_base, "all")
     
     if not all_certs:
         print("No certificates found or failed to fetch")
@@ -183,6 +195,7 @@ def main():
             # For missing P12, only download mobileprovision
             print(f"  Downloading mobileprovision only (missing P12)")
             success = download_certificate_file(
+                api_base,
                 cert_id, 
                 "cert.mobileprovision", 
                 cert_dir / "cert.mobileprovision",
@@ -191,7 +204,7 @@ def main():
         else:
             # Download full certificate bundle
             print(f"  Downloading certificate bundle")
-            success = download_certificate_zip(cert_id, folder_name, cert_dir, is_missing_p12=False)
+            success = download_certificate_zip(api_base, cert_id, folder_name, cert_dir, is_missing_p12=False)
         
         if success:
             # Verify files were downloaded

@@ -1,12 +1,22 @@
 {
+  "certificate_api_url": "https://sideloading.net/api/certificates",
+  "zsign_download_url": "https://github.com/zhlynn/zsign/releases/latest/download/zsign-linux-x86_64.tar.gz",
+  "ipa_sources": {
+    "Ksign": "https://github.com/Nyasami/Ksign/releases/latest/download/Ksign.ipa",
+    "Feather": "https://github.com/claration/Feather/releases/latest/download/Feather.ipa",
+    "ESign": "https://github.com/Neoncat-OG/TrollStore-IPAs/releases/download/ESign/ESign-5.0.2.ipa",
+    "Scarlet": "https://github.com/NexSideloading/scarlet-ipa/raw/refs/heads/main/ScarletAlpha.ipa"
+  },
+  "apps_requiring_signing_asset_injection": [
+    "Ksign",
+    "Feather"
+  ],
   "manifest_url_template": "https://raw.githubusercontent.com/{github_repo}/{github_ref}/signed_apps/{app_name}/{cert_name}/signed.ipa",
-  "github_repo": "NexSideloading/signer-direct-installs",
+  "github_repo": "YOUR_GITHUB_USERNAME/YOUR_REPOSITORY",
   "github_ref": "main",
   "icon_url_template": "https://raw.githubusercontent.com/{github_repo}/{github_ref}/icons/{icon_filename}",
-  "additional_apps": {},
-  "exclude_apps": [],
+  "fallback_icon_url": "https://sideloading.net/signer/fallback.png",
   "cert_filters": {
-    "include_revoked": true,
-    "include_missing_p12": false
+    "include_revoked": true
   }
 }

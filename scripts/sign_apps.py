@@ -23,13 +23,11 @@ CONFIG_FILE = REPO_ROOT / "config.json"
 
 def load_config() -> Dict:
     """Load configuration from config.json."""
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-# Apps that require signing asset injection
-APPS_REQUIRING_INJECTION = ["Ksign", "Feather"]
+    with CONFIG_FILE.open(encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    if not isinstance(config, dict):
+        raise ValueError(f"{CONFIG_FILE} must contain a JSON object")
+    return config
 
 def load_state() -> Dict:
     """Load the current signing state."""
@@ -102,9 +100,8 @@ def is_certificate_expired(valid_to: str) -> bool:
         print(f"  Failed to parse certificate expiry date: {valid_to}")
         return True  # Treat unparseable date as expired
 
-def download_zsign(output_dir: Path) -> Optional[Path]:
+def download_zsign(output_dir: Path, zsign_url: str) -> Optional[Path]:
     """Download zsign binary."""
-    zsign_url = "https://github.com/zhlynn/zsign/releases/latest/download/zsign-linux-x86_64.tar.gz"
     zsign_path = output_dir / "zsign"
     
     if zsign_path.exists():
@@ -180,7 +177,7 @@ def extract_metadata_from_signing_output(metadata_dir: Path, ipa_path: Path) -> 
         print(f"  Failed to extract metadata from signing output: {e}")
         return None
 
-def prepare_and_sign_ipa(ipa_path: Path, cert_files: Dict, output_path: Path, zsign_path: Path, app_name: str, cert_name: str) -> tuple[bool, Optional[Dict]]:
+def prepare_and_sign_ipa(ipa_path: Path, cert_files: Dict, output_path: Path, zsign_path: Path, app_name: str, cert_name: str, apps_requiring_injection: List[str]) -> tuple[bool, Optional[Dict]]:
     """Prepare and sign an IPA using zsign, with optional asset injection before signing."""
     metadata = None
     
@@ -218,7 +215,7 @@ def prepare_and_sign_ipa(ipa_path: Path, cert_files: Dict, output_path: Path, zs
             app_dir = app_dirs[0]
             
             # Inject signing assets for specific apps BEFORE signing
-            if app_name in APPS_REQUIRING_INJECTION:
+            if app_name in apps_requiring_injection:
                 print(f"  Injecting signing assets before signing...")
                 if not inject_signing_assets(app_dir, cert_files, cert_name):
                     print(f"  ⚠ Failed to inject signing assets")
@@ -320,23 +317,18 @@ def inject_signing_assets(extracted_app_dir: Path, cert_files: Dict, cert_name: 
         print(f"  Failed to inject signing assets: {e}")
         return False
 
-def generate_manifest(ipa_url: str, app_name: str, version: str, bundle_id: str, title: str, output_path: Path, icon_path: Optional[str] = None) -> bool:
+def generate_manifest(ipa_url: str, app_name: str, version: str, bundle_id: str, title: str, output_path: Path, config: Dict, icon_path: Optional[str] = None) -> bool:
     """Generate install manifest plist."""
-    config = load_config()
     # Use extracted icon if available, otherwise use generic placeholder
     if icon_path and Path(icon_path).exists():
-        # Use icon URL template from config
         icon_filename = Path(icon_path).name
-        icon_url_template = config.get('icon_url_template') or "https://raw.githubusercontent.com/{github_repo}/{github_ref}/icons/{icon_filename}"
-        github_repo = config.get('github_repo') or os.environ.get('GITHUB_REPOSITORY', 'NexSideloading/signer-direct-installs')
-        github_ref = config.get('github_ref') or os.environ.get('GITHUB_REF_NAME', 'main')
-        icon_url = icon_url_template.format(
-            github_repo=github_repo,
-            github_ref=github_ref,
-            icon_filename=icon_filename
+        icon_url = config["icon_url_template"].format(
+            github_repo=config["github_repo"],
+            github_ref=config["github_ref"],
+            icon_filename=quote(icon_filename)
         )
     else:
-        icon_url = "https://sideloading.net/signer/fallback.png"
+        icon_url = config["fallback_icon_url"]
     
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -425,6 +417,19 @@ def main(force_apps=None, force_certs=None, force_all=False):
     signing_state = load_state()
     cert_state = load_cert_state()
     config = load_config()
+
+    excluded_apps = config.get("exclude_apps", [])
+    apps_requiring_injection = config.get("apps_requiring_signing_asset_injection", [])
+    if not isinstance(excluded_apps, list) or not all(
+        isinstance(name, str) for name in excluded_apps
+    ):
+        raise ValueError("'exclude_apps' must be a list of app names")
+    if not isinstance(apps_requiring_injection, list) or not all(
+        isinstance(name, str) for name in apps_requiring_injection
+    ):
+        raise ValueError(
+            "'apps_requiring_signing_asset_injection' must be a list of app names"
+        )
     
     if not cert_state:
         print("No certificates found. Run fetch_certificates.py first.")
@@ -441,13 +446,17 @@ def main(force_apps=None, force_certs=None, force_all=False):
         print(f"Force re-signing with certificates: {force_certs}")
     
     # Download zsign
-    zsign_path = download_zsign(SCRIPT_DIR)
+    zsign_path = download_zsign(SCRIPT_DIR, config["zsign_download_url"])
     if not zsign_path:
         print("Failed to download zsign")
         return
     
     # Process each IPA
-    ipa_files = list(IPA_DIR.glob("*.ipa"))
+    ipa_files = [
+        ipa_path
+        for ipa_path in IPA_DIR.glob("*.ipa")
+        if ipa_path.stem not in excluded_apps
+    ]
     
     if not ipa_files:
         print("No IPA files found. Run download_ipas.py first.")
@@ -459,10 +468,9 @@ def main(force_apps=None, force_certs=None, force_all=False):
     # Apply certificate filters from config
     cert_filters = config.get('cert_filters', {})
     include_revoked = cert_filters.get('include_revoked', False)
-    include_missing_p12 = cert_filters.get('include_missing_p12', False)
     
-    if not include_revoked or not include_missing_p12:
-        print(f"Certificate filters: revoked={include_revoked}, missing_p12={include_missing_p12}")
+    if not include_revoked:
+        print(f"Certificate filters: revoked={include_revoked}")
     
     for ipa_path in ipa_files:
         app_name = ipa_path.stem
@@ -555,7 +563,15 @@ def main(force_apps=None, force_certs=None, force_all=False):
                 continue
             
             # Prepare and sign the IPA with optional asset injection
-            sign_success, metadata = prepare_and_sign_ipa(ipa_path, cert_files, signed_ipa_path, zsign_path, app_name, cert_name)
+            sign_success, metadata = prepare_and_sign_ipa(
+                ipa_path,
+                cert_files,
+                signed_ipa_path,
+                zsign_path,
+                app_name,
+                cert_name,
+                apps_requiring_injection,
+            )
             if not sign_success:
                 print(f"  ✗ Failed to sign with {cert_name}")
                 continue
@@ -565,23 +581,30 @@ def main(force_apps=None, force_certs=None, force_all=False):
             title = metadata.get('AppName', app_name) if metadata else app_name
             version = metadata.get('AppVersion', ipa_version) if metadata else ipa_version
             icon_path = metadata.get('icon_path') if metadata else None
+            custom_icon_path = REPO_ROOT / "icons" / f"{app_name}.png"
+            if custom_icon_path.is_file():
+                icon_path = str(custom_icon_path)
             
             print(f"  Using metadata - Bundle ID: {bundle_id}, Title: {title}, Version: {version}")
             
             # Generate manifest
-            # Use config or environment variables for GitHub hosting
-            github_repo = config.get('github_repo') or os.environ.get('GITHUB_REPOSITORY', 'your-username/your-repo')
-            github_ref = config.get('github_ref') or os.environ.get('GITHUB_REF_NAME', 'main')
-            
-            manifest_template = config.get('manifest_url_template') or "https://raw.githubusercontent.com/{github_repo}/{github_ref}/signed_apps/{app_name}/{cert_name}/signed.ipa"
-            ipa_url = manifest_template.format(
-                github_repo=github_repo,
-                github_ref=github_ref,
+            ipa_url = config["manifest_url_template"].format(
+                github_repo=config["github_repo"],
+                github_ref=config["github_ref"],
                 app_name=quote(app_name),
                 cert_name=quote(cert_name)
             )
             
-            if not generate_manifest(ipa_url, app_name, version, bundle_id, title, manifest_path, icon_path):
+            if not generate_manifest(
+                ipa_url,
+                app_name,
+                version,
+                bundle_id,
+                title,
+                manifest_path,
+                config,
+                icon_path,
+            ):
                 print(f"  ✗ Failed to generate manifest")
                 continue
             

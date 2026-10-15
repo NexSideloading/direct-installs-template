@@ -7,16 +7,39 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 
-# IPA sources with their URLs
-IPA_SOURCES = {
-    "Ksign": "https://github.com/Nyasami/Ksign/releases/latest/download/Ksign.ipa",
-    "Feather": "https://github.com/claration/Feather/releases/latest/download/Feather.ipa",
-    "ESign": "https://github.com/Neoncat-OG/TrollStore-IPAs/releases/download/ESign/ESign-5.0.2.ipa",
-    "Scarlet": "https://github.com/NexSideloading/scarlet-ipa/raw/refs/heads/main/ScarletAlpha.ipa",
-}
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_FILE = REPO_ROOT / "config.json"
+STATE_FILE = REPO_ROOT / "ipa_state.json"
 
-# State file to track downloaded IPAs
-STATE_FILE = Path(__file__).parent.parent / "ipa_state.json"
+def load_config() -> Dict:
+    """Load the repository configuration."""
+    with CONFIG_FILE.open(encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    if not isinstance(config, dict):
+        raise ValueError(f"{CONFIG_FILE} must contain a JSON object")
+    return config
+
+def get_ipa_sources(config: Dict) -> Dict[str, str]:
+    sources = config.get("ipa_sources", {})
+
+    if not isinstance(sources, dict):
+        raise ValueError("'ipa_sources' must be a JSON object")
+
+    combined_sources = {**sources}
+    for name, url in combined_sources.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or not isinstance(url, str)
+            or not url.startswith(("http://", "https://"))
+        ):
+            raise ValueError(f"Invalid IPA source entry: {name!r}")
+
+    return {
+        name: url
+        for name, url in combined_sources.items()
+    }
 
 def load_state() -> Dict:
     """Load the current state of downloaded IPAs."""
@@ -108,13 +131,15 @@ def main():
     
     # Load current state
     state = load_state()
+    config = load_config()
+    ipa_sources = get_ipa_sources(config)
     
     print("Checking IPA files for updates...")
     print("=" * 50)
     
     changed_ipas = []
     
-    for name, url in IPA_SOURCES.items():
+    for name, url in ipa_sources.items():
         output_path = ipa_dir / f"{name}.ipa"
         
         # Check if file exists and compare hash
