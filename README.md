@@ -13,6 +13,7 @@ For public over-the-air installation, the generated IPA and icon URLs must be re
 ## 1. Create your repository
 
 Use this repository as a GitHub template, or fork/copy it into a public repository you control. Keep the repository name and default branch handy; you will enter them in `config.json`.
+When cloning for the first time, use `--depth 1` in the git clone command.
 
 ## 2. Configure `config.json`
 
