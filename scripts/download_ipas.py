@@ -1,190 +1,697 @@
+
 #!/usr/bin/env python3
-import os
-import sys
-import requests
+
 import hashlib
 import json
+import os
+import plistlib
+import zipfile
+
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+
+# ============================================================
+# PATHS
+# ============================================================
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
 CONFIG_FILE = REPO_ROOT / "config.json"
 STATE_FILE = REPO_ROOT / "ipa_state.json"
+IPA_DIR = REPO_ROOT / "ipas"
 
-def load_config() -> Dict:
-    """Load the repository configuration."""
-    with CONFIG_FILE.open(encoding="utf-8") as config_file:
-        config = json.load(config_file)
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+USER_AGENT = "NexSideloading-Direct-Installs/1.0"
+
+HEAD_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = (15, 180)
+
+CHUNK_SIZE = 1024 * 1024
+
+
+# ============================================================
+# CONFIG LOADING
+# ============================================================
+
+def load_config() -> Dict[str, Any]:
+    """Load repository configuration."""
+
+    if not CONFIG_FILE.exists():
+        raise FileNotFoundError(
+            f"Configuration file not found: {CONFIG_FILE}"
+        )
+
+    with CONFIG_FILE.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+
     if not isinstance(config, dict):
-        raise ValueError(f"{CONFIG_FILE} must contain a JSON object")
+        raise ValueError(
+            "config.json must contain a JSON object"
+        )
+
     return config
 
-def get_ipa_sources(config: Dict) -> Dict[str, str]:
+
+def get_ipa_sources(config: Dict[str, Any]) -> Dict[str, str]:
+    """Extract and validate IPA sources from config.json."""
+
     sources = config.get("ipa_sources", {})
 
     if not isinstance(sources, dict):
-        raise ValueError("'ipa_sources' must be a JSON object")
+        raise ValueError(
+            "'ipa_sources' must be a JSON object"
+        )
 
-    combined_sources = {**sources}
-    for name, url in combined_sources.items():
+    validated_sources = {}
+
+    for name, url in sources.items():
+
         if (
             not isinstance(name, str)
             or not name
-            or Path(name).name != name
-            or not isinstance(url, str)
+            or name in (".", "..")
+            or "/" in name
+            or "\\" in name
+        ):
+            raise ValueError(
+                f"Invalid IPA application name: {name!r}"
+            )
+
+        if (
+            not isinstance(url, str)
             or not url.startswith(("http://", "https://"))
         ):
-            raise ValueError(f"Invalid IPA source entry: {name!r}")
+            raise ValueError(
+                f"Invalid IPA source URL for {name!r}: {url!r}"
+            )
 
-    return {
-        name: url
-        for name, url in combined_sources.items()
-    }
+        validated_sources[name] = url
 
-def load_state() -> Dict:
-    """Load the current state of downloaded IPAs."""
-    if STATE_FILE.exists():
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
+    return validated_sources
+
+
+# ============================================================
+# STATE MANAGEMENT
+# ============================================================
+
+def load_state() -> Dict[str, Any]:
+    """Load previously downloaded IPA state."""
+
+    if not STATE_FILE.exists():
+        return {}
+
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+
+        if isinstance(state, dict):
+            return state
+
+        print("Warning: Invalid IPA state format. Rebuilding state.")
+
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: Failed to load IPA state: {exc}")
+
     return {}
 
-def save_state(state: Dict):
-    """Save the current state of downloaded IPAs."""
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
+
+def save_state(state: Dict[str, Any]) -> None:
+    """Save IPA state atomically."""
+
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_file = STATE_FILE.with_suffix(".json.tmp")
+
+    try:
+        with temp_file.open("w", encoding="utf-8") as file:
+            json.dump(state, file, indent=2)
+            file.write("\n")
+
+        os.replace(temp_file, STATE_FILE)
+
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+
+# ============================================================
+# FILE HASHING
+# ============================================================
 
 def get_file_hash(filepath: Path) -> str:
-    """Calculate SHA256 hash of a file."""
-    sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+    """Calculate SHA-256 hash of a file."""
 
-def download_ipa(name: str, url: str, output_dir: Path, timeout: int = 30) -> Optional[Path]:
-    """Download an IPA file from URL, returns path if successful."""
-    output_path = output_dir / f"{name}.ipa"
-    
-    print(f"Checking {name}...")
-    
+    sha256 = hashlib.sha256()
+
+    with filepath.open("rb") as file:
+
+        for chunk in iter(
+            lambda: file.read(CHUNK_SIZE),
+            b"",
+        ):
+            sha256.update(chunk)
+
+    return sha256.hexdigest()
+
+
+# ============================================================
+# REMOTE METADATA
+# ============================================================
+
+def get_remote_metadata(
+    name: str,
+    url: str,
+) -> Tuple[Optional[Dict[str, Optional[str]]], bool]:
+    """
+    Retrieve remote file metadata using HTTP HEAD.
+
+    Returns:
+        (metadata, not_found)
+
+    Metadata:
+        etag
+        last_modified
+        content_length
+    """
+
+    headers = {
+        "User-Agent": USER_AGENT,
+    }
+
     try:
-        response = requests.head(url, timeout=timeout, allow_redirects=True)
-        if response.status_code == 404:
-            print(f"  ❌ {name} returned 404, skipping")
-            return None
-        
-        response = requests.get(url, timeout=timeout, stream=True)
-        response.raise_for_status()
-        
-        # Check if content type is IPA
-        content_type = response.headers.get('content-type', '')
-        if 'html' in content_type.lower() or 'text' in content_type.lower():
-            print(f"  ❌ {name} returned non-IPA content (content-type: {content_type}), skipping")
-            return None
-        
-        # Download to temp file first
-        temp_path = output_dir / f"{name}.ipa.tmp"
-        with open(temp_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        # Verify it's a valid zip file (IPAs are zip files)
-        try:
-            import zipfile
-            with zipfile.ZipFile(temp_path, 'r') as zip_ref:
-                # Check if it has Payload directory (IPA structure)
-                if 'Payload/' not in zip_ref.namelist():
-                    print(f"  ❌ {name} downloaded but doesn't appear to be a valid IPA, skipping")
-                    temp_path.unlink()
-                    return None
-        except zipfile.BadZipFile:
-            print(f"  ❌ {name} downloaded but is not a valid zip file, skipping")
-            temp_path.unlink()
-            return None
-        
-        # Move temp file to final location
-        if output_path.exists():
-            output_path.unlink()
-        temp_path.rename(output_path)
-        
-        print(f"  ✅ {name} downloaded successfully")
-        return output_path
-        
-    except requests.exceptions.Timeout:
-        print(f"  ❌ {name} timed out, skipping")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"  ❌ {name} failed to download: {e}, skipping")
-        return None
-    except Exception as e:
-        print(f"  ❌ {name} unexpected error: {e}, skipping")
-        return None
+        with requests.head(
+            url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=HEAD_TIMEOUT,
+        ) as response:
 
-def main():
-    """Main function to download all IPAs."""
-    script_dir = Path(__file__).parent
-    repo_root = script_dir.parent
-    ipa_dir = repo_root / "ipas"
-    
-    # Create IPAs directory
-    ipa_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load current state
-    state = load_state()
+            if response.status_code == 404:
+                print(f"  {name}: Remote IPA returned 404.")
+                return None, True
+
+            if response.status_code in (405, 501):
+                print(f"  {name}: HEAD unsupported. Falling back to GET.")
+                return None, False
+
+            response.raise_for_status()
+
+            return {
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+                "content_length": response.headers.get("Content-Length"),
+            }, False
+
+    except requests.exceptions.RequestException as exc:
+
+        print(f"  {name}: HEAD request failed: {exc}")
+        print(f"  {name}: Will verify by downloading the IPA.")
+
+        return None, False
+
+
+def remote_matches_saved_state(
+    remote: Optional[Dict[str, Optional[str]]],
+    saved: Dict[str, Any],
+    local_path: Path,
+) -> bool:
+    """
+    Determine whether the remote IPA is unchanged.
+
+    The local SHA-256 must match saved state, and the
+    remote HTTP validators must also match saved metadata.
+    """
+
+    if not remote or not local_path.is_file():
+        return False
+
+    saved_hash = saved.get("hash")
+
+    if not saved_hash:
+        return False
+
+    try:
+        local_hash = get_file_hash(local_path)
+
+        if local_hash != saved_hash:
+            return False
+
+    except OSError:
+        return False
+
+    # Check remote file size when available.
+    remote_size = remote.get("content_length")
+
+    if remote_size is not None:
+
+        try:
+            if local_path.stat().st_size != int(remote_size):
+                return False
+
+        except (ValueError, OSError):
+            return False
+
+    # Prefer ETag.
+    remote_etag = remote.get("etag")
+    saved_etag = saved.get("etag")
+
+    if remote_etag and saved_etag:
+        return remote_etag == saved_etag
+
+    # Fall back to Last-Modified and Content-Length.
+    remote_modified = remote.get("last_modified")
+    saved_modified = saved.get("last_modified")
+    saved_size = saved.get("content_length")
+
+    if (
+        remote_modified
+        and saved_modified
+        and remote_size
+        and saved_size
+    ):
+        return (
+            remote_modified == saved_modified
+            and str(remote_size) == str(saved_size)
+        )
+
+    # No reliable validators available.
+    # Download and compare actual hashes instead.
+    return False
+
+
+# ============================================================
+# IPA VALIDATION
+# ============================================================
+
+def validate_ipa(filepath: Path) -> bool:
+    """Validate that a downloaded file is a genuine IPA archive."""
+
+    try:
+        with zipfile.ZipFile(filepath, "r") as archive:
+
+            names = archive.namelist()
+
+            # Find the application's Info.plist.
+            info_plist_path = next(
+                (
+                    name
+                    for name in names
+                    if name.startswith("Payload/")
+                    and name.endswith(".app/Info.plist")
+                ),
+                None,
+            )
+
+            if not info_plist_path:
+                print(
+                    "  Invalid IPA: "
+                    "Payload/*.app/Info.plist not found."
+                )
+                return False
+
+            # Validate the property list.
+            plist_data = archive.read(info_plist_path)
+
+            plist = plistlib.loads(plist_data)
+
+            if not isinstance(plist, dict):
+                print("  Invalid IPA: Info.plist is not a dictionary.")
+                return False
+
+            # Verify archive integrity.
+            damaged_file = archive.testzip()
+
+            if damaged_file is not None:
+                print(
+                    f"  Invalid IPA: Corrupted archive member: "
+                    f"{damaged_file}"
+                )
+                return False
+
+        if filepath.stat().st_size == 0:
+            print("  Invalid IPA: Empty file.")
+            return False
+
+        return True
+
+    except (
+        OSError,
+        zipfile.BadZipFile,
+        KeyError,
+        plistlib.InvalidFileException,
+        ValueError,
+    ) as exc:
+
+        print(f"  IPA validation failed: {exc}")
+        return False
+
+
+# ============================================================
+# IPA DOWNLOAD
+# ============================================================
+
+def download_ipa(
+    name: str,
+    url: str,
+    output_dir: Path,
+) -> Tuple[Optional[Path], Dict[str, Optional[str]]]:
+    """
+    Download an IPA to a temporary file.
+
+    Never replaces the existing IPA until the new download
+    has been completely downloaded and validated.
+    """
+
+    temp_path = output_dir / (
+        f".{name}.{os.getpid()}.ipa.tmp"
+    )
+
+    headers = {
+        "User-Agent": USER_AGENT,
+    }
+
+    temp_path.unlink(missing_ok=True)
+
+    try:
+        print(f"  Downloading {name}...")
+
+        with requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            allow_redirects=True,
+            timeout=DOWNLOAD_TIMEOUT,
+        ) as response:
+
+            if response.status_code == 404:
+                print(f"  {name}: Remote IPA returned 404.")
+                return None, {}
+
+            response.raise_for_status()
+
+            content_type = response.headers.get(
+                "Content-Type",
+                "",
+            ).lower()
+
+            invalid_types = (
+                "text/",
+                "application/json",
+                "application/xml",
+            )
+
+            if content_type.startswith(invalid_types):
+                print(
+                    f"  {name}: Expected an IPA, received "
+                    f"{content_type}."
+                )
+                return None, {}
+
+            metadata = {
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+                "content_length": response.headers.get("Content-Length"),
+            }
+
+            downloaded_bytes = 0
+
+            with temp_path.open("wb") as file:
+
+                for chunk in response.iter_content(
+                    chunk_size=CHUNK_SIZE
+                ):
+
+                    if not chunk:
+                        continue
+
+                    file.write(chunk)
+
+                    downloaded_bytes += len(chunk)
+
+        if not temp_path.exists() or temp_path.stat().st_size == 0:
+            print(f"  {name}: Downloaded file is empty.")
+            return None, {}
+
+        # Validate downloaded archive.
+        if not validate_ipa(temp_path):
+            print(f"  {name}: Invalid IPA. Existing file preserved.")
+            return None, {}
+
+        print(
+            f"  {name}: Download successful "
+            f"({downloaded_bytes:,} bytes)."
+        )
+
+        return temp_path, metadata
+
+    except requests.exceptions.Timeout:
+        print(f"  {name}: Download timed out.")
+
+    except requests.exceptions.RequestException as exc:
+        print(f"  {name}: Download failed: {exc}")
+
+    except OSError as exc:
+        print(f"  {name}: File operation failed: {exc}")
+
+    except Exception as exc:
+        print(f"  {name}: Unexpected error: {exc}")
+
+    temp_path.unlink(missing_ok=True)
+
+    return None, {}
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> List[str]:
+    """
+    Check configured IPA sources for updates.
+
+    Returns:
+        List of successfully changed IPA application names.
+
+    This return value is consumed by run_all.py to determine
+    which applications need to be re-signed.
+    """
+
+    # Prepare directories.
+    IPA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load configuration and saved state.
     config = load_config()
+
     ipa_sources = get_ipa_sources(config)
-    
-    print("Checking IPA files for updates...")
-    print("=" * 50)
-    
-    changed_ipas = []
-    
+
+    state = load_state()
+
+    changed_ipas: List[str] = []
+
+    print("Checking upstream IPA sources for updates...")
+    print("=" * 60)
+
     for name, url in ipa_sources.items():
-        output_path = ipa_dir / f"{name}.ipa"
-        
-        # Check if file exists and compare hash
-        needs_download = True
-        if output_path.exists():
-            existing_hash = get_file_hash(output_path)
-            stored_hash = state.get(name, {}).get('hash')
-            if existing_hash == stored_hash:
-                print(f"  ✓ {name} is up to date")
-                needs_download = False
+
+        print(f"\nChecking {name}...")
+
+        output_path = IPA_DIR / f"{name}.ipa"
+
+        previous_state = state.get(name, {})
+
+        if not isinstance(previous_state, dict):
+            previous_state = {}
+
+        # ----------------------------------------------------
+        # 1. Check remote metadata.
+        # ----------------------------------------------------
+
+        remote_metadata, not_found = get_remote_metadata(
+            name,
+            url,
+        )
+
+        if not_found:
+            print(f"  {name}: Keeping existing IPA.")
+            continue
+
+        # ----------------------------------------------------
+        # 2. Check if remote asset is unchanged.
+        # ----------------------------------------------------
+
+        if remote_matches_saved_state(
+            remote_metadata,
+            previous_state,
+            output_path,
+        ):
+
+            print(f"  {name}: Already up to date.")
+            continue
+
+        print(f"  {name}: Remote asset needs verification.")
+
+        # ----------------------------------------------------
+        # 3. Hash existing local IPA.
+        # ----------------------------------------------------
+
+        existing_hash = None
+
+        if output_path.is_file():
+
+            try:
+                existing_hash = get_file_hash(output_path)
+
+            except OSError as exc:
+                print(f"  {name}: Could not hash existing IPA: {exc}")
+
+        # ----------------------------------------------------
+        # 4. Download latest IPA.
+        # ----------------------------------------------------
+
+        temp_path, download_metadata = download_ipa(
+            name,
+            url,
+            IPA_DIR,
+        )
+
+        if temp_path is None:
+
+            print(
+                f"  {name}: Download unsuccessful. "
+                "Existing IPA preserved."
+            )
+
+            continue
+
+        try:
+
+            # ------------------------------------------------
+            # 5. Compare actual hashes.
+            # ------------------------------------------------
+
+            downloaded_hash = get_file_hash(temp_path)
+
+            old_state_hash = previous_state.get("hash")
+
+            file_changed = downloaded_hash != existing_hash
+
+            # Detect cases where the IPA was previously replaced
+            # but the state file was not successfully updated.
+            state_outdated = (
+                old_state_hash is not None
+                and downloaded_hash != old_state_hash
+            )
+
+            # ------------------------------------------------
+            # 6. Replace existing IPA if different.
+            # ------------------------------------------------
+
+            if file_changed:
+
+                os.replace(
+                    temp_path,
+                    output_path,
+                )
+
+                print(
+                    f"  {name}: Updated successfully "
+                    f"({output_path.stat().st_size:,} bytes)."
+                )
+
             else:
-                print(f"  🔄 {name} has changed, downloading new version")
+
+                temp_path.unlink(missing_ok=True)
+
+                print(
+                    f"  {name}: Downloaded IPA is identical. "
+                    "No replacement needed."
+                )
+
+            # ------------------------------------------------
+            # 7. Update saved state.
+            # ------------------------------------------------
+
+            etag = (
+                download_metadata.get("etag")
+                or (remote_metadata or {}).get("etag")
+            )
+
+            last_modified = (
+                download_metadata.get("last_modified")
+                or (remote_metadata or {}).get("last_modified")
+            )
+
+            content_length = (
+                download_metadata.get("content_length")
+                or (remote_metadata or {}).get("content_length")
+                or str(output_path.stat().st_size)
+            )
+
+            state[name] = {
+                "hash": downloaded_hash,
+                "last_updated": str(output_path.stat().st_mtime),
+                "etag": etag,
+                "last_modified": last_modified,
+                "content_length": content_length,
+            }
+
+            # ------------------------------------------------
+            # 8. Tell run_all.py what needs re-signing.
+            # ------------------------------------------------
+
+            if file_changed or state_outdated:
+
                 changed_ipas.append(name)
-        else:
-            print(f"  📥 {name} not found locally, downloading")
-            changed_ipas.append(name)
-        
-        if needs_download:
-            # Download the IPA
-            result_path = download_ipa(name, url, ipa_dir)
-            
-            if result_path:
-                # Calculate hash of downloaded file
-                file_hash = get_file_hash(result_path)
-                state[name] = {
-                    'hash': file_hash,
-                    'last_updated': str(Path(result_path).stat().st_mtime)
-                }
-            else:
-                # If download failed but file exists, keep existing state
-                if output_path.exists():
-                    print(f"  ℹ️  {name} keeping existing file due to download failure")
-                else:
-                    # Remove from state if file doesn't exist and download failed
-                    if name in state:
-                        del state[name]
-    
-    # Save updated state
+
+                print(
+                    f"  {name}: Added to re-signing queue."
+                )
+
+        except OSError as exc:
+
+            print(
+                f"  {name}: Failed to process downloaded IPA: {exc}"
+            )
+
+            temp_path.unlink(missing_ok=True)
+
+    # ========================================================
+    # SAVE STATE
+    # ========================================================
+
     save_state(state)
-    
-    print("=" * 50)
-    print(f"IPA check completed. Changed IPAs: {len(changed_ipas)}")
-    
-    # Return changed IPAs for use by other scripts
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    print("\n" + "=" * 60)
+
+    print(
+        f"IPA check completed. "
+        f"Changed IPAs: {len(changed_ipas)}"
+    )
+
+    if changed_ipas:
+
+        print("\nApplications requiring re-signing:")
+
+        for name in changed_ipas:
+            print(f"  - {name}")
+
+    else:
+
+        print("\nAll configured IPAs are up to date.")
+
+    # Keep compatibility with run_all.py.
     return changed_ipas
+
 
 if __name__ == "__main__":
     main()
